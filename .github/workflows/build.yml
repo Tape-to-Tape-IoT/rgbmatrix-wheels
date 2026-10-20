@@ -1,0 +1,72 @@
+name: Build wheel
+
+# Manual: run it with the upstream commit the scoreboard's pyproject.toml pins,
+# whenever that pin moves. One release per commit, tagged rgbmatrix-<short sha>.
+on:
+  workflow_dispatch:
+    inputs:
+      rev:
+        description: hzeller/rpi-rgb-led-matrix commit (full 40-char SHA, as pinned in pyproject.toml)
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # Native arm64, so no QEMU: the compile takes minutes, not an hour.
+    # Hosted arm64 runners are free on public repos.
+    runs-on: ubuntu-24.04-arm
+    env:
+      REV: ${{ inputs.rev }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the commit and the tag
+        run: |
+          [[ "$REV" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::rev must be a full 40-char SHA"; exit 1; }
+          TAG="rgbmatrix-${REV:0:7}"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          # A published wheel is never replaced: the scoreboard's uv.lock pins its hash.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::$TAG is already released, and published wheels are immutable"
+            exit 1
+          fi
+
+      - name: Build in Debian Trixie
+        run: docker run --rm -v "$PWD:/work" debian:trixie bash /work/build.sh "$REV"
+
+      - name: Release
+        run: |
+          WHEEL="$(cd dist && ls rgbmatrix-*.whl)"
+          URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$WHEEL"
+          cat > notes.md <<EOF
+          [hzeller/rpi-rgb-led-matrix](https://github.com/hzeller/rpi-rgb-led-matrix) Python bindings at
+          [\`$REV\`](https://github.com/hzeller/rpi-rgb-led-matrix/tree/$REV), built on Debian Trixie arm64
+          for CPython 3.13. One wheel for every 64-bit Pi, Zero 2 W to Pi 5.
+
+          The only build setting is \`CMAKE_C_FLAGS=-idirafter /usr/include/python3.13\`, an include path.
+          No panel options are compiled in.
+
+          GPL-2.0-or-later. The exact source is attached.
+
+          In nhl-led-scoreboard-v2's \`pyproject.toml\`:
+
+          \`\`\`toml
+          rgbmatrix = { url = "$URL" }
+          \`\`\`
+
+          \`\`\`
+          $(cat dist/SHA256SUMS)
+          \`\`\`
+          EOF
+          gh release create "$TAG" dist/* --title "rgbmatrix @ ${REV:0:7}" --notes-file notes.md
+
+          # The wheel's name carries a '+' (a local version). If GitHub renamed the
+          # asset, uv would reject it, so fail here rather than on a Pi.
+          NAMES="$(gh release view "$TAG" --json assets -q '.assets[].name')"
+          for f in dist/*; do
+            grep -qxF "$(basename "$f")" <<<"$NAMES" \
+              || { echo "::error::GitHub renamed the asset $(basename "$f")"; exit 1; }
+          done
